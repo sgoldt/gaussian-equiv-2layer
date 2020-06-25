@@ -1,8 +1,9 @@
 # Code for "The Gaussian equivalence of generative models for learning with two-layer  neural networks"
 
 Here we provide the code used to run all the experiments of our recent paper on
-the Gaussian Equivalence of generative models. There are several parts to this
-package: (for step-by-step explanations, see below)
+"The Gaussian Equivalence of generative models for learning in two-layer neural
+networks" [1]. There are several parts to this package: (for step-by-step
+explanations, see below)
 
 | File                          | Description                                                                                                                                                    |
 |-------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -14,6 +15,18 @@ package: (for step-by-step explanations, see below)
 | ```libscmpp.h```              | C++ utility functions                                                                                                                                          |
 | ```models```                  | random and pre-trained weights used for the experiments with the DCGAN,<br>as well as the corresponding covariance matrices                                    |
 | ```twolayer.py```             | Python utility functions                                                                                                                                       |
+| ```realnvp.py```              | pyTorch implementation of real NVP model by [Fangzhou Mu](https://github.com/fmu2)                                                                             |
+| ```data_utils.py```           | Utility functions for real NVP model by [Fangzhou Mu](https://github.com/fmu2)                                                                                 |
+
+## External packages included in this repository
+
+We were fortunate to be able to use the implementation of the DCGAN from the
+pyTorch example repository, provided together with pre-trained weights by
+[Chandan Singh](https://github.com/csinva). We are also grateful to [Fangzhou
+Mu](https://github.com/fmu2) for his pyTorch port of the original real NVP
+implementation. We include both these packages in this repository to make
+reproducing the paper's experiments as easy as possible, but you should check
+out the other work of Chandan and Fangzhou, too !
 
 
 # Compilation of the C++ code
@@ -40,11 +53,14 @@ To train a two-layer model on input drawn from a generative model
 ```
 ./deepgen_online.py -M 2 -K 2 --lr 0.2 --scenario dcgan_rand
 ```
-Other options for scenario are ```rand```, which is the random one-layer
-generator corresponding to Theorem 1, ```dcgan_rand```, which is the DCGAN with
-random weights, and ```dcgan_cifar10``` which is the DCGAN with pre-trained
-weights, provided by [Chandan
-Singh](https://github.com/csinva/gan-vae-pretrained-pytorch). This command will train an actual network with K hidden nodes, while the teacher
+The following scenarios are possible:
+- ```rand```, which is the random one-layer
+generator corresponding to Theorem 1,
+- ```dcgan_rand```, which is the DCGAN with random weights
+- ```dcgan_cifar10``` which is the DCGAN trained on CIFAR10, and
+- ```nvp_cifar10``` which is the real NVP model trained on CIFAR10.
+
+This command will train an actual network with K hidden nodes, while the teacher
 has M hidden nodes, and the learning rate is 0.2. For a full overview over the
 parameters, run
 ```
@@ -71,5 +87,4 @@ explained in the comment lines in the header of the output file.
 
 # References
 
-[1] Radford, Alec, Luke Metz, and Soumith Chintala. "Unsupervised representation
-learning with deep convolutional generative adversarial networks." ICLR 2016, [arXiv:1511.06434](http://arxiv.org/abs/1511.06434)
+[1] S. Goldt, G. Reeves, M. Mézard, F. Krzakala, L. Zdeborová [arXiv:1906.xxxxx]

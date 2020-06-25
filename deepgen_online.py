@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 #
-# Training two-layer networks on inputs coming from a deep generator.
-#
-# Author: Sebastian Goldt <goldt.sebastian@gmail.com>
+# Training two-layer networks on inputs coming from various deep generators.
 #
 # Date: May 2020
-
+#
+# Author: Sebastian Goldt <goldt.sebastian@gmail.com>
 
 import argparse
 import math
@@ -13,13 +12,18 @@ import math
 import numpy as np  # for storing tensors in CSV format
 
 import torch
+import torch.distributions as distributions
 import torch.optim as optim
 import torch.nn as nn
 import torch.nn.functional as F
 
 from dcgan import Generator
 from generators import RandomGenerator, Sign
-from twolayer import TwoLayer, identity, erfscaled
+from mlp.twolayer import TwoLayer, identity, erfscaled
+
+import realnvp, data_utils
+from data_utils import Hyperparameters
+
 
 NUM_TESTSAMPLES = 10000
 
@@ -30,6 +34,41 @@ class HalfMSELoss(nn.MSELoss):
 
     def forward(self, input, target):
         return 0.5 * F.mse_loss(input, target, reduction=self.reduction)
+
+
+def eval_student(time, student, test_xs, test_ys, nus, T, tildeT, A, criterion):
+    N = test_xs.shape[1]
+
+    student.eval()
+    with torch.no_grad():
+        # compute the generalisation error w.r.t. the noiseless teacher
+        preds = student(test_xs)
+        eg = criterion(preds, test_ys)
+
+        w = student.fc1.weight.data
+        v = student.fc2.weight.data
+        lambdas = w.mm(test_xs.T) / math.sqrt(N)
+        Q_num = lambdas.mm(lambdas.T) / NUM_TESTSAMPLES
+        R_num = lambdas.mm(nus.T) / NUM_TESTSAMPLES
+
+        eg_analytical = get_eg_analytical(Q_num, R_num, T, A, v)
+
+        msg = "%g, %g, %g, nan, " % (time, eg, eg_analytical)
+
+        # upper triangular elements for symmetric matrices
+        indices_K = Q_num.triu().nonzero().T
+        indices_M = T.triu().nonzero().T
+        Q_num_vals = Q_num[indices_K[0], indices_K[1]].cpu().numpy()
+        msg += ", ".join(map(str, Q_num_vals)) + ", "
+        msg += ", ".join(map(str, R_num.flatten().cpu().numpy())) + ", "
+        T_vals = T[indices_M[0], indices_M[1]].cpu().numpy()
+        msg += ", ".join(map(str, T_vals)) + ", "
+        tildeT_vals = tildeT[indices_M[0], indices_M[1]].cpu().numpy()
+        msg += ", ".join(map(str, tildeT_vals)) + ", "
+        msg += ", ".join(map(str, A.flatten().cpu().numpy())) + ", "
+        msg += ", ".join(map(str, v.flatten().cpu().numpy())) + ", "
+
+        return msg[:-2]
 
 
 def get_eg_analytical(Q, R, T, A, v):
@@ -58,6 +97,37 @@ def get_eg_analytical(Q, R, T, A, v):
     norm = torch.ger(sqrtQ, sqrtT)
     eg_analytical -= 2.0 * torch.sum((v.t() @ A) * torch.asin(R / norm))
     return eg_analytical / math.pi
+
+
+def get_samples(scenario, hmm, P, D, N, generator, teacher, mean_x, device):
+    """
+    Generates a set of test samples.
+
+    Parameters:
+    -----------
+
+    scenario : string describing the scenario, e.g. dcgan_rand, nvp_cifar10, ...
+    hmm : if True, the teacher is acting on the latent variables.
+    P : number of samples
+    D : latent dimension
+    N : input dimension
+    generator : generative model that transforms latent variables to inputs
+    teacher : teacher networks
+    mean_x : the mean of the generator's output
+    """
+    with torch.no_grad():
+        cs = torch.randn(P, D).to(device)
+        latent = cs
+        if scenario.startswith("dcgan"):
+            latent = latent.unsqueeze(-1).unsqueeze(-1)
+        elif scenario.startswith("nvp"):
+            latent = latent.reshape(-1, 3, 32, 32)
+        xs = generator(latent).reshape(-1, N)
+        xs -= mean_x
+        teacher_inputs = cs if hmm else xs
+        ys = teacher(teacher_inputs)
+
+        return cs, xs, ys
 
 
 def write_density(fname, density):
@@ -96,9 +166,7 @@ def main():
     M_help = "number of teacher hidden nodes"
     K_help = "number of student hidden nodes"
     device_help = "which device to run on: 'cuda' or 'cpu'"
-    scenario_help = (
-        "Some pre-configured scenarios: rand, spiked, dcgan_rand, dcgan_cifar10."
-    )
+    scenario_help = "Some pre-configured scenarios: rand, dcgan_rand, dcgan_cifar10, nvp_imnet32."
     steps_help = "training steps as multiples of N"
     seed_help = "random number generator seed."
     hmm_help = "have teacher act on latent representation."
@@ -113,6 +181,7 @@ def main():
     parser.add_argument("--scenario", help=scenario_help, default="rand")
     parser.add_argument("--device", "-d", help=device_help)
     parser.add_argument("--lr", type=float, default=0.2, help="learning rate")
+    parser.add_argument("--bs", type=int, default=1, help="mini-batch size")
     parser.add_argument("--steps", type=int, default=10000, help=steps_help)
     parser.add_argument("-q", "--quiet", help="be quiet", action="store_true")
     parser.add_argument("-s", "--seed", type=int, default=0, help=seed_help)
@@ -133,11 +202,14 @@ def main():
     # Find the right generator for the given scenario
     loadweightsfrom = None
     scenario_desc = None
+    num_gen_params = 0
     if scenario == "rand":
         Ds = [args.D] * L + [N]
         f = Sign
         generator = RandomGenerator(Ds, f, batchnorm=False)
         scenario_desc = "rand_sign_L%d" % L
+        generator.eval()
+        generator.to(device)
     elif args.scenario in ["dcgan_rand", "dcgan_cifar10"]:
         D = 100
         N = 3072
@@ -147,11 +219,21 @@ def main():
         loadweightsfrom = "models/%s_weights.pth" % args.scenario
         generator.load_state_dict(torch.load(loadweightsfrom, map_location=device))
         scenario_desc = scenario
+        generator.eval()
+        generator.to(device)
+    elif args.scenario == "nvp_cifar10":
+        D = 3072
+        N = 3072
+        scenario_desc = args.scenario
+
+        flow = torch.load("models/nvp_cifar10.model", map_location=device)
+        num_gen_params = sum(p.numel() for p in flow.parameters())
+        generator = flow.g
     else:
         raise ValueError("Did not recognise the scenario here, will exit now.")
 
-    generator.eval()
-    generator.to(device)
+    if num_gen_params == 0:
+        num_gen_params = sum(p.numel() for p in generator.parameters())
 
     # output file + welcome message
     hmm_desc = "hmm_" if args.hmm else ""
@@ -168,7 +250,14 @@ def main():
     )
     logfile = open(log_fname, "w", buffering=1)
     welcome = "# Two-layer nets on inputs from a generator (scenario %s)\n" % scenario
-    welcome += "# M=%d, K=%d, lr=%g, seed=%d\n" % (M, K, lr, args.seed)
+    welcome += "# M=%d, K=%d, lr=%g, batch size=%d, seed=%d\n" % (
+        M,
+        K,
+        lr,
+        args.bs,
+        args.seed,
+    )
+    welcome += "# Generator has %d parameters\n" % num_gen_params
     if loadweightsfrom is not None:
         welcome += "# generator weights from %s\n" % (loadweightsfrom)
     welcome += "# Using device:" + str(device)
@@ -208,7 +297,7 @@ def main():
     # Obtain the right covariance matrices
     Phi = None
     Omega = None
-    mean_x = None
+    mean_x = torch.zeros(N, device=device)
     if scenario == "rand":
         b = math.sqrt(2 / np.pi)
         c = 1
@@ -219,28 +308,33 @@ def main():
                 Omega = b2 * F @ F.T
                 Phi = b * F
             else:
-                Omega = b2 * F @ ((c - b2) * torch.eye(F.shape[1]) + Omega) @ F.T
+                I = torch.eye(F.shape[1]).to(device)
+                Omega = b2 * F @ ((c - b2) * I + Omega) @ F.T
                 Phi = b * F @ Phi
         Omega[np.diag_indices(N)] = c
-        mean_x = torch.zeros(N)
-    elif scenario in ["rand_spiked_L1", "dcgan_rand", "dcgan_cifar10"]:
+
+        torch.save(Omega, "models/rand_omega.pt")
+        torch.save(Phi, "models/rand_phi.pt")
+    elif scenario in ["fc_inverse", "dcgan_rand", "dcgan_cifar10", "nvp_cifar10"]:
         Omega = torch.load("models/%s_omega.pt" % scenario, map_location=device)
         Phi = torch.load("models/%s_phi.pt" % scenario, map_location=device)
         mean_x = torch.load("models/%s_mean_x.pt" % scenario, map_location=device)
-    else:
-        raise ValueError("Do not have statistics for this scenario yet.")
 
     # generate the test set
-    with torch.no_grad():
-        test_cs = torch.randn(NUM_TESTSAMPLES, D).to(device)
-        latent = test_cs
-        if scenario.startswith("dcgan"):
-            latent = latent.unsqueeze(-1).unsqueeze(-1)
-        test_xs = generator(latent).reshape(-1, N)
-        test_xs -= mean_x
-        teacher_inputs = test_cs if args.hmm else test_xs
-        test_ys = teacher(teacher_inputs)
-        nus = B.mm(teacher_inputs.T) / math.sqrt(teacher_inputs.shape[1])
+    test_cs, test_xs, test_ys = get_samples(
+        args.scenario,
+        args.hmm,
+        NUM_TESTSAMPLES,
+        D,
+        N,
+        generator,
+        teacher,
+        mean_x,
+        device,
+    )
+
+    teacher_inputs = test_cs if args.hmm else test_xs
+    nus = B.mm(teacher_inputs.T) / math.sqrt(teacher_inputs.shape[1])
 
     msg = "# test xs: mean=%g, std=%g; test ys: std=%g" % (
         torch.mean(test_xs),
@@ -252,106 +346,74 @@ def main():
     T = 1.0 / B.shape[1] * B @ B.T
     rotation = Phi.T @ Phi
     tildeT = 1 / N * B @ rotation @ B.T
-    with torch.no_grad():
-        # compute the exact densities of r and q
-        exq = torch.zeros((K, K, N), device=device)
-        exr = torch.zeros((K, M, N), device=device)
-        extildet = torch.zeros((M, M, N), device=device)
-        sqrtN = math.sqrt(N)
-        w = student.fc1.weight.data
-        v = student.fc2.weight.data
+    if args.store:
+        with torch.no_grad():
+            # compute the exact densities of r and q
+            exq = torch.zeros((K, K, N), device=device)
+            exr = torch.zeros((K, M, N), device=device)
+            extildet = torch.zeros((M, M, N), device=device)
+            sqrtN = math.sqrt(N)
+            w = student.fc1.weight.data
+            v = student.fc2.weight.data
 
-        rhos, psis = torch.symeig(Omega, eigenvectors=True)
-        rhos.to(device)
-        psis.to(device)
-        #  make sure to normalise, orient evectors according to the note
-        psis = sqrtN * psis.T
+            rhos, psis = torch.symeig(Omega, eigenvectors=True)
+            rhos.to(device)
+            psis.to(device)
+            #  make sure to normalise, orient evectors according to the note
+            psis = sqrtN * psis.T
 
-        GammaB = 1.0 / sqrtN * B @ Phi.T @ psis.T
-        GammaW = 1.0 / sqrtN * w @ psis.T
+            GammaB = 1.0 / sqrtN * B @ Phi.T @ psis.T
+            GammaW = 1.0 / sqrtN * w @ psis.T
 
-        for k in range(K):
-            for l in range(K):
-                exq[k, l] = GammaW[k, :] * GammaW[l, :]
+            for k in range(K):
+                for l in range(K):
+                    exq[k, l] = GammaW[k, :] * GammaW[l, :]
+                for n in range(M):
+                    exr[k, n] = GammaW[k, :] * GammaB[n, :]
             for n in range(M):
-                exr[k, n] = GammaW[k, :] * GammaB[n, :]
-        for n in range(M):
-            for m in range(M):
-                extildet[n, m] = GammaB[n, :] * GammaB[m, :]
+                for m in range(M):
+                    extildet[n, m] = GammaB[n, :] * GammaB[m, :]
 
-        root_name = log_fname[:-4]
-        np.savetxt(root_name + "_T.dat", T.cpu().numpy(), delimiter=",")
-        np.savetxt(root_name + "_rhos.dat", rhos.cpu().numpy(), delimiter=",")
-        np.savetxt(root_name + "_T.dat", T.cpu().numpy(), delimiter=",")
-        np.savetxt(root_name + "_A.dat", A[0].cpu().numpy(), delimiter=",")
-        np.savetxt(root_name + "_v0.dat", v[0].cpu().numpy(), delimiter=",")
+            root_name = log_fname[:-4]
+            np.savetxt(root_name + "_T.dat", T.cpu().numpy(), delimiter=",")
+            np.savetxt(root_name + "_rhos.dat", rhos.cpu().numpy(), delimiter=",")
+            np.savetxt(root_name + "_T.dat", T.cpu().numpy(), delimiter=",")
+            np.savetxt(root_name + "_A.dat", A[0].cpu().numpy(), delimiter=",")
+            np.savetxt(root_name + "_v0.dat", v[0].cpu().numpy(), delimiter=",")
 
-        write_density(root_name + "_q0.dat", exq)
-        write_density(root_name + "_r0.dat", exr)
-        write_density(root_name + "_tildet.dat", extildet)
+            write_density(root_name + "_q0.dat", exq)
+            write_density(root_name + "_r0.dat", exr)
+            write_density(root_name + "_tildet.dat", extildet)
 
     time = 0
     dt = 1 / N
+
+    msg = eval_student(time, student, test_xs, test_ys, nus, T, tildeT, A, criterion)
+    log(msg, logfile)
     while len(times_to_print) > 0:
-        if time >= times_to_print[0].item() or time == 0:
-            student.eval()
-            with torch.no_grad():
-                # compute the generalisation error w.r.t. the noiseless teacher
-                preds = student(test_xs)
-                eg = criterion(preds, test_ys)
+        # get the inputs
+        cs, inputs, targets = get_samples(
+            args.scenario, args.hmm, args.bs, D, N, generator, teacher, mean_x, device
+        )
 
-                w = student.fc1.weight.data
-                v = student.fc2.weight.data
-                lambdas = w.mm(test_xs.T) / math.sqrt(N)
-                Q_num = lambdas.mm(lambdas.T) / NUM_TESTSAMPLES
-                R_num = lambdas.mm(nus.T) / NUM_TESTSAMPLES
+        for i in range(args.bs):
+            student.train()
+            preds = student(inputs[i])
+            loss = criterion(preds, targets[i])
 
-                if args.g == "erf":
-                    eg_analytical = get_eg_analytical(Q_num, R_num, T, A, v)
-                else:
-                    eg_analytical = "nan"
+            # TRAINING
+            student.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-                msg = "%g, %g, %g, nan, " % (time, eg, eg_analytical)
+            time += dt
 
-                # upper triangular elements for symmetric matrices
-                indices_K = Q_num.triu().nonzero().T
-                indices_M = T.triu().nonzero().T
-                Q_num_vals = Q_num[indices_K[0], indices_K[1]].cpu().numpy()
-                msg += ", ".join(map(str, Q_num_vals)) + ", "
-                msg += ", ".join(map(str, R_num.flatten().cpu().numpy())) + ", "
-                T_vals = T[indices_M[0], indices_M[1]].cpu().numpy()
-                msg += ", ".join(map(str, T_vals)) + ", "
-                tildeT_vals = tildeT[indices_M[0], indices_M[1]].cpu().numpy()
-                msg += ", ".join(map(str, tildeT_vals)) + ", "
-                msg += ", ".join(map(str, A.flatten().cpu().numpy())) + ", "
-                msg += ", ".join(map(str, v.flatten().cpu().numpy())) + ", "
-                log(msg[:-2], logfile)
+            if time >= times_to_print[0].item() or time == 0:
+                msg = eval_student(
+                    time, student, test_xs, test_ys, nus, T, tildeT, A, criterion
+                )
+                log(msg, logfile)
                 times_to_print.pop(0)
-
-                if eg < 1e-6:
-                    break
-
-        # TRAINING PREPARATION
-        student.train()
-        with torch.no_grad():
-            cs = torch.randn(1, D).to(device)
-            latent = cs
-            if scenario.startswith("dcgan"):
-                latent = latent.unsqueeze(-1).unsqueeze(-1)
-            inputs = generator(latent).reshape(-1, N)
-            inputs -= mean_x
-            teacher_inputs = cs if args.hmm else inputs
-            targets = teacher(teacher_inputs)
-
-        preds = student(inputs)
-        loss = criterion(preds, targets)
-
-        # TRAINING
-        student.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        time += dt
 
     print("Bye-bye")
 
