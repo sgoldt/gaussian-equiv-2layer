@@ -2,7 +2,7 @@
 
 Here we provide the code used to run all the experiments of our recent paper on
 "The Gaussian Equivalence of generative models for learning in two-layer neural
-networks" [1]. There are several parts to this package: (for step-by-step
+networks" [[1, arXiv]](https://arxiv.org/abs/2006.14709). There are several parts to this package: (for step-by-step
 explanations, see below)
 
 | File                          | Description                                                                                                                                                    |
@@ -87,4 +87,4 @@ explained in the comment lines in the header of the output file.
 
 # References
 
-[1] S. Goldt, G. Reeves, M. Mézard, F. Krzakala, L. Zdeborová [arXiv:1906.xxxxx]
+[1] S. Goldt, G. Reeves, M. Mézard, F. Krzakala, L. Zdeborová [[arXiv:2006.14709]](https://arxiv.org/abs/2006.14709)
